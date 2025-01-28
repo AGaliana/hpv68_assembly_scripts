@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Crear el directorio de salida si no existe
+mkdir -p "$output_dir"
+
+# Procesar cada archivo fastq.gz en el directorio de entrada
+for input_file in "$input_dir"/*.fastq.gz; do
+    # Obtener el nombre base del archivo sin la extensión
+    sample_id=$(basename "$input_file" .fastq.gz)
+
+    echo "Procesando muestra: $sample_id..."
+
+    # Cambiar al directorio de salida
+    cd "$output_dir" || exit 1
+
+    # Mapear las lecturas
+    echo "Mapeando las lecturas para $sample_id..."
+    minimap2 -ax map-ont "${FILE_REF}.fasta" "$input_file" > "${sample_id}.sam"
+    if [[ $? -ne 0 ]]; then
+        echo "Error en el mapeo con minimap2 para $sample_id" >&2
+        continue
+    fi
+
+    # Filtrar lecturas mapeadas
+    echo "Filtrando lecturas mapeadas para $sample_id..."
+    samtools view -F 4 "${sample_id}.sam" > "${sample_id}.sample.mapped.sam"
+    samtools view -b -T "${FILE_REF}.fasta" "${sample_id}.sample.mapped.sam" > "${sample_id}.out.bam"
+
+    # Trim primers
+    echo "Recortando primers para $sample_id..."
+    ivar trim -i "${sample_id}.out.bam" -b "${FILE_PRIMER_BED}.bed" -f "${FILE_PRIMER_LIST}.tsv" -q 1 -e -p "${sample_id}.trimed"
+
+    # Ordenar archivo BAM
+    samtools sort "${sample_id}.trimed.bam" -o "${sample_id}.trimed.sorted.bam"
+
+    # Variant calling con bcftools
+    bcftools mpileup -X ont -Ou -f "${FILE_REF}.fasta" "${sample_id}.trimed.sorted.bam" | \
+    bcftools call -P 0.1 -c -M -Oz -o "${sample_id}.ONT.calls.vcf.gz"
+
+    # Crear índice del archivo VCF
+    bcftools index "${sample_id}.ONT.calls.vcf.gz"
+
+    # Normalizar el archivo VCF
+    bcftools norm -f "${FILE_REF}.fasta" "${sample_id}.ONT.calls.vcf.gz" -Ob -o "${sample_id}.ONT.calls.norm.bcf"
+
+    # Identificar posiciones con cobertura baja
+    bedtools genomecov -bga -ibam "${sample_id}.trimed.sorted.bam" | awk '$4<20' > "${sample_id}.low_coverage.bed"
+
+    # Generar secuencia consenso
+    cat "${FILE_REF}.fasta" | bcftools consensus "${sample_id}.ONT.calls.vcf.gz" \
+    --mask "${sample_id}.low_coverage.bed" -p "${sample_id}" -H A --absent 'N' > "${sample_id}.ONT.consensus.fasta"
+
+    # Corregir la secuencia consenso con Medaka
+    medaka_consensus -i "$input_file" -d "${sample_id}.ONT.consensus.fasta" \
+    -o medaka_${sample_id} -m r1041_e82_400bps_fast_variant_g615 -g
+
+    echo "Pipeline completado para la muestra: $sample_id"
+done
+
+echo "¡Pipeline completado para todas las muestras!"
